@@ -1,0 +1,101 @@
+name: Advanced Video Processing Workflow
+
+on:
+  workflow_dispatch: # Allows manual triggering
+    inputs:
+      simulation_mode:
+        description: 'Simulation mode for video_processor.sh (no_videos, 1_pass, 2_pass)'
+        required: true
+        default: '1_pass'
+        type: choice
+        options:
+          - no_videos
+          - 1_pass
+          - 2_pass
+  push: # Or any other trigger you prefer
+    branches:
+      - main # Or your default branch
+
+jobs:
+  initial_setup_and_check:
+    name: Initial Setup and Video Check
+    runs-on: ubuntu-latest
+    outputs:
+      decision: ${{ steps.parser.outputs.decision }}
+      num_fragments: ${{ steps.parser.outputs.num_fragments }}
+      # We'll need a JSON array of fragment numbers for the matrix strategy later
+      fragment_list_json: ${{ steps.matrix_generator.outputs.fragment_list_json }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Make script executable
+        run: chmod +x ./video_processor.sh
+
+      - name: Run video processor script
+        id: processor
+        run: |
+          # Using the input from workflow_dispatch to control the script's behavior
+          output=$(./video_processor.sh "${{ github.event.inputs.simulation_mode || '1_pass' }}")
+          echo "Script raw output: $output"
+          # Escape newlines for multiline outputs if any, though not expected here
+          output="${output//$'\n'/''}" 
+          echo "::set-output name=raw_output::$output"
+
+      - name: Parse script output
+        id: parser
+        run: |
+          raw_output="${{ steps.processor.outputs.raw_output }}"
+          decision="unknown"
+          fragments=0
+
+          if [[ "$raw_output" == "No videos found" ]]; then
+            decision="stop"
+            echo "Decision: Stop workflow (No videos found)."
+          elif [[ "$raw_output" == *"1 pass"* ]]; then
+            decision="one_pass"
+            fragments=$(echo "$raw_output" | awk -F', ' '{print $2}')
+            echo "Decision: 1 Pass. Fragments: $fragments"
+          elif [[ "$raw_output" == *"2 pass"* ]]; then
+            decision="two_pass"
+            fragments=$(echo "$raw_output" | awk -F', ' '{print $2}')
+            echo "Decision: 2 Pass. Fragments: $fragments"
+          else
+            echo "::error::Unknown script output: $raw_output"
+            decision="error" # Mark as error to prevent further steps
+            exit 1
+          fi
+          echo "::set-output name=decision::$decision"
+          echo "::set-output name=num_fragments::$fragments"
+
+      - name: Generate fragment list for matrix
+        id: matrix_generator
+        # Only run if we're not stopping and have fragments
+        if: steps.parser.outputs.decision != 'stop' && steps.parser.outputs.decision != 'error' && steps.parser.outputs.num_fragments > 0
+        run: |
+          count=${{ steps.parser.outputs.num_fragments }}
+          json_array="["
+          for i in $(seq 1 $count); do
+            json_array+="$i"
+            if [ $i -lt $count ]; then
+              json_array+=","
+            fi
+          done
+          json_array+="]"
+          echo "Generated fragment list JSON: $json_array"
+          echo "::set-output name=fragment_list_json::$json_array"
+        # Set a default empty array if not generating, so fromJson doesn't fail
+      - name: Set default fragment list if not generated
+        if: steps.matrix_generator.outputs.fragment_list_json == ''
+        run: echo "::set-output name=fragment_list_json::[]"
+        shell: bash # ensure bash for steps.output context
+
+  # ---- Placeholder for "No videos found" condition ----
+  # We don't need an explicit job to stop. If `decision` is 'stop',
+  # subsequent jobs conditioned on 'one_pass' or 'two_pass' simply won't run.
+  # The workflow will complete successfully after initial_setup_and_check.
+  # If you want an explicit failure, the parser step could `exit 1` or
+  # you could have a job that runs if decision is 'stop' and then fails.
+  # For now, "stopping" means no further processing jobs run.
+
+  # ---- We will add next jobs here in the following steps ----
