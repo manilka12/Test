@@ -1,7 +1,7 @@
 name: Advanced Video Processing Workflow
 
 on:
-  workflow_dispatch: # Allows manual triggering
+  workflow_dispatch:
     inputs:
       simulation_mode:
         description: 'Simulation mode for video_processor.sh (no_videos, 1_pass, 2_pass)'
@@ -12,9 +12,20 @@ on:
           - no_videos
           - 1_pass
           - 2_pass
-  push: # Or any other trigger you prefer
+      # Internal input to manage re-triggering and prevent immediate infinite loops
+      _retriggered_run:
+        description: 'Internal: Marks if this run was re-triggered by the workflow itself.'
+        required: false
+        default: 'false'
+        type: 'string' # Using string 'true'/'false' for easier conditional checks
+  push:
     branches:
       - main # Or your default branch
+
+# Grant GITHUB_TOKEN permissions. 'actions: write' is needed for gh workflow run.
+permissions:
+  contents: read # For checkout
+  actions: write # For gh workflow run to re-trigger this workflow
 
 jobs:
   initial_setup_and_check:
@@ -23,8 +34,9 @@ jobs:
     outputs:
       decision: ${{ steps.parser.outputs.decision }}
       num_fragments: ${{ steps.parser.outputs.num_fragments }}
-      # We'll need a JSON array of fragment numbers for the matrix strategy later
       fragment_list_json: ${{ steps.matrix_generator.outputs.fragment_list_json }}
+      # Pass through the original simulation mode for potential re-trigger
+      current_simulation_mode: ${{ github.event.inputs.simulation_mode || '1_pass' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -35,12 +47,15 @@ jobs:
       - name: Run video processor script
         id: processor
         run: |
-          # Using the input from workflow_dispatch to control the script's behavior
-          output=$(./video_processor.sh "${{ github.event.inputs.simulation_mode || '1_pass' }}")
+          # Use the input from workflow_dispatch or the default from push
+          effective_simulation_mode="${{ github.event.inputs.simulation_mode || '1_pass' }}"
+          echo "Running script with mode: $effective_simulation_mode"
+          output=$(./video_processor.sh "$effective_simulation_mode")
           echo "Script raw output: $output"
-          # Escape newlines for multiline outputs if any, though not expected here
-          output="${output//$'\n'/''}" 
-          echo "::set-output name=raw_output::$output"
+          # Sanitize output for use in GITHUB_OUTPUT
+          output="${output//$'\n'/''}"
+          output="${output//$'\r'/''}"
+          echo "raw_output=$output" >> $GITHUB_OUTPUT
 
       - name: Parse script output
         id: parser
@@ -61,16 +76,15 @@ jobs:
             fragments=$(echo "$raw_output" | awk -F', ' '{print $2}')
             echo "Decision: 2 Pass. Fragments: $fragments"
           else
-            echo "::error::Unknown script output: $raw_output"
-            decision="error" # Mark as error to prevent further steps
+            echo "::error title=Unknown Script Output::Unknown script output received: '$raw_output'"
+            decision="error" # Mark as error
             exit 1
           fi
-          echo "::set-output name=decision::$decision"
-          echo "::set-output name=num_fragments::$fragments"
+          echo "decision=$decision" >> $GITHUB_OUTPUT
+          echo "num_fragments=$fragments" >> $GITHUB_OUTPUT
 
       - name: Generate fragment list for matrix
         id: matrix_generator
-        # Only run if we're not stopping and have fragments
         if: steps.parser.outputs.decision != 'stop' && steps.parser.outputs.decision != 'error' && steps.parser.outputs.num_fragments > 0
         run: |
           count=${{ steps.parser.outputs.num_fragments }}
@@ -83,19 +97,114 @@ jobs:
           done
           json_array+="]"
           echo "Generated fragment list JSON: $json_array"
-          echo "::set-output name=fragment_list_json::$json_array"
-        # Set a default empty array if not generating, so fromJson doesn't fail
+          echo "fragment_list_json=$json_array" >> $GITHUB_OUTPUT
+      
       - name: Set default fragment list if not generated
+        # This step ensures fragment_list_json is always set, even if empty.
         if: steps.matrix_generator.outputs.fragment_list_json == ''
-        run: echo "::set-output name=fragment_list_json::[]"
-        shell: bash # ensure bash for steps.output context
+        run: |
+          echo "fragment_list_json=[]" >> $GITHUB_OUTPUT
+        shell: bash
 
-  # ---- Placeholder for "No videos found" condition ----
-  # We don't need an explicit job to stop. If `decision` is 'stop',
-  # subsequent jobs conditioned on 'one_pass' or 'two_pass' simply won't run.
-  # The workflow will complete successfully after initial_setup_and_check.
-  # If you want an explicit failure, the parser step could `exit 1` or
-  # you could have a job that runs if decision is 'stop' and then fails.
-  # For now, "stopping" means no further processing jobs run.
+  # --- 1-Pass Processing ---
+  one_pass_fragments:
+    name: Process 1-Pass Fragment ${{ matrix.fragment_id }}
+    needs: initial_setup_and_check
+    # Only run if decision is 'one_pass' and there are fragments
+    if: needs.initial_setup_and_check.outputs.decision == 'one_pass' && fromJson(needs.initial_setup_and_check.outputs.fragment_list_json)[0] != null
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false # Continue other fragments if one fails
+      matrix:
+        fragment_id: ${{ fromJson(needs.initial_setup_and_check.outputs.fragment_list_json) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-  # ---- We will add next jobs here in the following steps ----
+      - name: Identify Fragment (1-Pass)
+        run: |
+          echo "This is a 1-Pass macOS runner."
+          echo "I am processing fragment number: ${{ matrix.fragment_id }}"
+          # Replace with your actual fragment processing script/commands
+          # Example: ./process_fragment.sh ${{ matrix.fragment_id }} 1_pass_args
+          sleep 10 # Simulate work
+
+  trigger_restart_after_one_pass:
+    name: Restart Workflow After 1-Pass
+    needs: 
+      - initial_setup_and_check # To get the decision and original simulation mode
+      - one_pass_fragments     # Ensure all 1-pass fragments are done
+    # Condition:
+    # 1. Decision must be 'one_pass'.
+    # 2. There must have been fragments (implies one_pass_fragments was intended to run or did run).
+    # 3. This run must NOT have been triggered by '_retriggered_run=true' (simple loop prevention).
+    if: |
+      needs.initial_setup_and_check.outputs.decision == 'one_pass' &&
+      fromJson(needs.initial_setup_and_check.outputs.fragment_list_json)[0] != null &&
+      (github.event.inputs._retriggered_run == null || github.event.inputs._retriggered_run == 'false')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger new workflow run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The simulation_mode for the NEXT run.
+          # For this example, we're just re-using the one that led to this 1-pass.
+          # In a real scenario, your script might have determined a *new* state or mode.
+          NEXT_SIMULATION_MODE: ${{ needs.initial_setup_and_check.outputs.current_simulation_mode }}
+        run: |
+          echo "1-Pass processing completed. Attempting to trigger a new workflow run."
+          echo "Next run simulation mode: $NEXT_SIMULATION_MODE"
+          
+          # Using gh CLI to re-trigger the current workflow
+          # ${{ github.workflow }} is the name or ID of the current workflow.
+          # ${{ github.ref }} is the current branch/tag.
+          gh workflow run ${{ github.workflow }} \
+            --ref ${{ github.ref }} \
+            -f simulation_mode="$NEXT_SIMULATION_MODE" \
+            -f _retriggered_run="true"
+            
+          echo "Workflow re-trigger command issued."
+          echo "NOTE: This re-trigger relies on the GITHUB_TOKEN having 'actions: write' permission for this repository."
+          echo "If this step fails, check repository/organization Action settings or consider using a PAT with 'repo' scope."
+
+  # --- 2-Pass Processing ---
+  two_pass_fragments:
+    name: Process 2-Pass Fragment ${{ matrix.fragment_id }}
+    needs: initial_setup_and_check
+    # Only run if decision is 'two_pass' and there are fragments
+    if: needs.initial_setup_and_check.outputs.decision == 'two_pass' && fromJson(needs.initial_setup_and_check.outputs.fragment_list_json)[0] != null
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false # Continue other fragments if one fails
+      matrix:
+        fragment_id: ${{ fromJson(needs.initial_setup_and_check.outputs.fragment_list_json) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Identify Fragment (2-Pass)
+        run: |
+          echo "This is a 2-Pass macOS runner."
+          echo "I am processing fragment number: ${{ matrix.fragment_id }}"
+          # Replace with your actual fragment processing script/commands
+          # Example: ./process_fragment.sh ${{ matrix.fragment_id }} 2_pass_args
+          sleep 10 # Simulate work
+
+  two_pass_combination:
+    name: Combine 2-Pass Results
+    needs: 
+      - initial_setup_and_check # To get the decision
+      - two_pass_fragments     # Ensure all 2-pass fragments are done
+    # Only run if 2-pass was the decision and there were fragments (implies two_pass_fragments ran)
+    if: needs.initial_setup_and_check.outputs.decision == 'two_pass' && fromJson(needs.initial_setup_and_check.outputs.fragment_list_json)[0] != null
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4 # If combination logic needs repo files
+
+      - name: Run Combination Logic
+        run: |
+          echo "This is the Ubuntu instance for 2-Pass combination."
+          echo "All 2-pass fragments have completed."
+          # Replace with your actual combination script/commands
+          sleep 5 # Simulate work
